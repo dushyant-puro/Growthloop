@@ -4,8 +4,19 @@ from typing import Dict, Any, Optional
 
 class BanditArm:
     """
-    Beta-Binomial Thompson Sampling Arm for dynamic offer/pricing optimization.
-    Maintains alpha (successes/conversions) and beta (failures/non-conversions) priors.
+    Bayesian Bernoulli bandit arm.
+
+    Posterior:
+        Beta(alpha, beta)
+
+    Thompson Sampling:
+        draw theta ~ Beta(alpha, beta)
+
+    Conversion:
+        alpha += 1
+
+    Non-conversion:
+        beta += 1
     """
 
     def __init__(
@@ -14,7 +25,7 @@ class BanditArm:
         label: str,
         discount_pct: float,
         price: float = 999.0,
-        base_sim_rate: float = 0.1,
+        true_conversion_rate: float = 0.10,
         alpha: float = 1.0,
         beta: float = 1.0,
         status: str = "ACTIVE",
@@ -23,58 +34,130 @@ class BanditArm:
         self.arm_id = arm_id
         self.label = label
         self.name = label
+
         self.discount_pct = float(discount_pct)
         self.price = float(price)
-        self.base_sim_rate = float(base_sim_rate)
+
+        # Hidden simulation parameter.
+        # It is intentionally NOT exposed to the frontend.
+        self._true_conversion_rate = float(true_conversion_rate)
+
         self.alpha = float(alpha)
         self.beta = float(beta)
+
         self.trials = 0
         self.conversions = 0
+
         self.status = status
         self.metadata = metadata or {}
 
+    # ---------------------------------------------------------
+    # THOMPSON SAMPLING
+    # ---------------------------------------------------------
+
     def sample(self) -> float:
-        """Draw a random sample from the Beta(alpha, beta) posterior distribution."""
-        return random.betavariate(self.alpha, self.beta)
+        """
+        Draw one Thompson Sampling value from the posterior.
+        """
+
+        return random.betavariate(
+            self.alpha,
+            self.beta
+        )
+
+    # ---------------------------------------------------------
+    # BAYESIAN UPDATE
+    # ---------------------------------------------------------
 
     def update(self, converted: bool) -> None:
-        """Update Beta priors and trial counts based on conversion outcome."""
+        """
+        Update posterior after observing one customer.
+        """
+
         self.trials += 1
+
         if converted:
             self.alpha += 1.0
             self.conversions += 1
         else:
             self.beta += 1.0
 
+    # ---------------------------------------------------------
+    # POSTERIOR STATISTICS
+    # ---------------------------------------------------------
+
     @property
-    def successes(self) -> int:
-        return self.conversions
+    def posterior_mean(self) -> float:
+        """
+        Expected value of Beta(alpha, beta).
+        """
+
+        return self.alpha / (
+            self.alpha + self.beta
+        )
+
+    @property
+    def empirical_conversion_rate(self) -> float:
+        """
+        Observed conversion rate.
+        """
+
+        if self.trials == 0:
+            return 0.0
+
+        return self.conversions / self.trials
+
+    @property
+    def posterior_probability_pct(self) -> float:
+        return round(
+            self.posterior_mean * 100,
+            2
+        )
 
     @property
     def win_rate(self) -> float:
-        """Win rate percentage."""
-        if self.trials == 0:
-            return round((self.alpha / (self.alpha + self.beta)) * 100, 1)
-        return round((self.conversions / self.trials) * 100, 1)
+        """
+        Backwards-compatible field for frontend.
 
-    @property
-    def expected_conversion_rate(self) -> float:
-        return self.alpha / (self.alpha + self.beta)
+        This is now explicitly the posterior mean,
+        not empirical conversion rate.
+        """
+
+        return self.posterior_probability_pct
+
+    # ---------------------------------------------------------
+    # SERIALIZATION
+    # ---------------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize arm state to dictionary format for frontend & API consumption."""
+
         return {
             "arm_id": self.arm_id,
             "label": self.label,
             "name": self.name,
+
             "discount_pct": self.discount_pct,
             "price": self.price,
-            "base_sim_rate": self.base_sim_rate,
+
             "alpha": round(self.alpha, 2),
             "beta": round(self.beta, 2),
+
             "trials": self.trials,
             "conversions": self.conversions,
-            "win_rate": self.win_rate,
+
+            "posterior_mean": round(
+                self.posterior_mean * 100,
+                2
+            ),
+
+            "empirical_conversion_rate": round(
+                self.empirical_conversion_rate * 100,
+                2
+            ),
+
+            "win_rate": self.posterior_probability_pct,
+
             "status": self.status,
-            "metadata": self.metadata,
+
+            "metadata": self.metadata
         }

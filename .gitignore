@@ -31,3 +31,8 @@ pnpm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+.env
+__pycache__/
+*.pyc
+growthloop_audit.jsonl

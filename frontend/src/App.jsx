@@ -1,258 +1,511 @@
-import React, { useState, useEffect } from "react";
-import { 
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell 
-} from "recharts";
-import { 
-  ShieldCheck, AlertTriangle, Play, CheckCircle2, RotateCcw, Sparkles, Loader2 
-} from "lucide-react";
+import { useEffect, useMemo, useState, useCallback } from "react";
+import { Sidebar } from "./components/Sidebar";
+import { PageHeader } from "./components/PageHeader";
+import { Toast } from "./components/Toast";
+import { ExperimentView } from "./components/views/ExperimentView";
+import { PerformanceView } from "./components/views/PerformanceView";
+import { GuardrailsView } from "./components/views/GuardrailsView";
+import { AuditView } from "./components/views/AuditView";
 
-export default function App() {
-  const [data, setData] = useState({ item_price: 999, arms: [], audit_trail: [] });
+const API = "http://localhost:8000";
+
+const ensureRazorpayLoaded = async () => {
+  if (typeof window !== "undefined" && window.Razorpay) {
+    return true;
+  }
+  return new Promise((resolve) => {
+    if (typeof window === "undefined") {
+      resolve(false);
+      return;
+    }
+    const existing = document.querySelector('script[src*="checkout.razorpay.com"]');
+    if (existing) {
+      if (window.Razorpay) {
+        resolve(true);
+        return;
+      }
+      existing.addEventListener("load", () => resolve(!!window.Razorpay));
+      existing.addEventListener("error", () => resolve(false));
+      setTimeout(() => resolve(!!window.Razorpay), 1500);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+    script.async = true;
+    script.onload = () => resolve(!!window.Razorpay);
+    script.onerror = () => resolve(false);
+    document.head.appendChild(script);
+    setTimeout(() => resolve(!!window.Razorpay), 2500);
+  });
+};
+
+export function App() {
+  // Navigation State
+  const [activeView, setActiveView] = useState("experiment");
+  const [mobileOpen, setMobileOpen] = useState(false);
+
+  // Backend Data State
+  const [data, setData] = useState({
+    item_price: 999,
+    arms: [],
+    audit_trail: [],
+    experiment: null,
+    audit_verified: false,
+    razorpay_key_id: null,
+  });
+
+  // Action / Form States
   const [merchantContext, setMerchantContext] = useState(
     "D2C footwear merchant: 68% cart abandonment on orders above ₹1,000 during late evening traffic."
   );
   const [isProcessing, setIsProcessing] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isDeploying, setIsDeploying] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+  const [isTestingGuardrail, setIsTestingGuardrail] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [lastViolationResult, setLastViolationResult] = useState(null);
 
-  const fetchState = async () => {
-    try {
-      const res = await fetch("http://localhost:8000/api/state");
-      const json = await res.json();
-      setData(json);
-    } catch (err) {
-      console.error("Failed to connect to backend", err);
-    }
-  };
+  // Toast Notification
+  const [toast, setToast] = useState(null);
 
-  useEffect(() => {
-    fetchState();
-    const interval = setInterval(fetchState, 1200);
-    return () => clearInterval(interval);
+  const showToast = useCallback((message, type = "success") => {
+    setToast({ message, type });
+    setTimeout(() => {
+      setToast(null);
+    }, 4000);
   }, []);
 
+  // ----------------------------------------------------------
+  // API: Fetch State
+  // ----------------------------------------------------------
+  const fetchState = useCallback(async () => {
+    try {
+      const response = await fetch(`${API}/api/state`);
+      if (!response.ok) {
+        throw new Error("Backend unavailable");
+      }
+      const json = await response.json();
+      setData({
+        item_price: json.item_price ?? 999,
+        arms: json.arms ?? [],
+        audit_trail: json.audit_trail ?? [],
+        experiment: json.experiment ?? null,
+        audit_verified: json.audit_verified ?? false,
+        razorpay_key_id: json.razorpay_key_id ?? null,
+      });
+      setIsConnected(true);
+    } catch (error) {
+      console.error("Failed to fetch backend state:", error);
+      setIsConnected(false);
+    }
+  }, []);
+
+  // Initial Fetch & 2.5s Polling
+  useEffect(() => {
+    let cancelled = false;
+    async function loadData() {
+      try {
+        const response = await fetch(`${API}/api/state`);
+        if (!response.ok) throw new Error("Backend unavailable");
+        const json = await response.json();
+        if (!cancelled) {
+          setData({
+            item_price: json.item_price ?? 999,
+            arms: json.arms ?? [],
+            audit_trail: json.audit_trail ?? [],
+            experiment: json.experiment ?? null,
+            audit_verified: json.audit_verified ?? false,
+            razorpay_key_id: json.razorpay_key_id ?? null,
+          });
+          setIsConnected(true);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error("Failed to fetch backend state:", error);
+          setIsConnected(false);
+        }
+      }
+    }
+
+    loadData();
+    const interval = setInterval(loadData, 2500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // ----------------------------------------------------------
+  // API: Generate AI Hypotheses
+  // ----------------------------------------------------------
   const handleGenerateHypotheses = async () => {
+    if (!merchantContext.trim()) {
+      showToast("Please enter merchant context first.", "warning");
+      return;
+    }
+
     setIsGenerating(true);
     try {
-      await fetch("http://localhost:8000/api/agent/hypothesize", {
+      const response = await fetch(`${API}/api/agent/hypothesize`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ context: merchantContext }),
       });
+
+      if (!response.ok) {
+        throw new Error("Hypothesis generation failed");
+      }
+
       await fetchState();
-    } catch (err) {
-      console.error("Hypothesis generation failed:", err);
+      setActiveView("experiment");
+      showToast("AI hypotheses generated and evaluated against guardrails.");
+    } catch (error) {
+      console.error(error);
+      showToast("Unable to generate hypotheses.", "error");
     } finally {
       setIsGenerating(false);
     }
   };
 
+  // ----------------------------------------------------------
+  // API: Simulate Batch (Route 25 checkouts)
+  // ----------------------------------------------------------
   const runBatch = async () => {
     setIsProcessing(true);
-    await fetch("http://localhost:8000/api/simulate-batch", { method: "POST" });
-    await fetchState();
-    setIsProcessing(false);
+    try {
+      const response = await fetch(`${API}/api/simulate-batch`, {
+        method: "POST",
+      });
+
+      if (!response.ok) {
+        throw new Error("Simulation failed");
+      }
+
+      const result = await response.json();
+      await fetchState();
+
+      if (result.error) {
+        showToast(result.error, "warning");
+      } else {
+        showToast("25 simulated checkouts routed through Thompson Sampling.");
+      }
+    } catch (error) {
+      console.error(error);
+      showToast("Checkout simulation failed.", "error");
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
+  // ----------------------------------------------------------
+  // API: Test Guardrail Violation
+  // ----------------------------------------------------------
   const triggerViolation = async () => {
-    await fetch("http://localhost:8000/api/test-guardrail-violation", { method: "POST" });
-    await fetchState();
+    setIsTestingGuardrail(true);
+    try {
+      const response = await fetch(`${API}/api/test-guardrail-violation`, {
+        method: "POST",
+      });
+
+      if (!response.ok) {
+        throw new Error("Guardrail test failed");
+      }
+
+      const result = await response.json();
+      setLastViolationResult(result);
+      await fetchState();
+
+      if (result.accepted) {
+        showToast("Guardrail test unexpectedly passed.", "error");
+      } else {
+        showToast(
+          "Guardrail intercept verified: unsafe 35% discount deterministically blocked.",
+          "warning"
+        );
+      }
+    } catch (error) {
+      console.error(error);
+      showToast("Guardrail test failed.", "error");
+    } finally {
+      setIsTestingGuardrail(false);
+    }
   };
 
+  // ----------------------------------------------------------
+  // API: Deploy Winner & Open Razorpay Checkout
+  // ----------------------------------------------------------
   const deployTopArm = async () => {
-    await fetch("http://localhost:8000/api/deploy-winner", { method: "POST" });
-    await fetchState();
+    console.log("[GrowthLoop] Promote clicked");
+    setIsDeploying(true);
+    try {
+      const isLoaded = await ensureRazorpayLoaded();
+      console.log("[GrowthLoop] Razorpay script loaded:", isLoaded, "window.Razorpay available:", !!window.Razorpay);
+
+      const response = await fetch(`${API}/api/deploy-winner`, {
+        method: "POST",
+      });
+
+      const result = await response.json();
+      console.log("[GrowthLoop] Promotion response:", result);
+      console.log("[GrowthLoop] Razorpay available:", !!window.Razorpay);
+      console.log("[GrowthLoop] Razorpay order:", result.razorpay_order);
+
+      await fetchState();
+
+      if (result.success && result.razorpay_order) {
+        const order = result.razorpay_order;
+        const keyId =
+          result.razorpay_key_id ||
+          data.razorpay_key_id ||
+          import.meta.env.VITE_RAZORPAY_KEY_ID ||
+          "rzp_test_TYNF1gJH3U5Hmc";
+
+        console.log("[GrowthLoop] Opening Razorpay Checkout with order ID:", order.id, "and key:", keyId);
+
+        if (typeof window === "undefined" || !window.Razorpay) {
+          console.error("[GrowthLoop] window.Razorpay is not defined");
+          showToast(
+            `Strategy promoted! Razorpay order ${order.id} created, but Checkout script failed to load.`,
+            "warning"
+          );
+          return;
+        }
+
+        const options = {
+          key: keyId,
+          amount: order.amount,
+          currency: order.currency || "INR",
+          name: "GrowthLoop",
+          description: `GrowthLoop Checkout Experiment - ${result.winner?.label || "Promoted Strategy"}`,
+          order_id: order.id,
+          handler: function (paymentResponse) {
+            console.log("[GrowthLoop] Payment successful:", paymentResponse);
+            showToast(
+              `Test payment successful! Razorpay Payment ID: ${paymentResponse.razorpay_payment_id}`,
+              "success"
+            );
+            fetchState();
+          },
+          prefill: {
+            name: "GrowthLoop Merchant",
+            email: "checkout@growthloop.test",
+            contact: "9999999999",
+          },
+          notes: {
+            experiment: "growthloop",
+            strategy: result.winner?.label,
+            arm_id: result.winner?.arm_id,
+            order_id: order.id,
+          },
+          theme: {
+            color: "#059669",
+          },
+          modal: {
+            ondismiss: function () {
+              console.log("[GrowthLoop] Checkout modal dismissed by user.");
+            },
+          },
+        };
+
+        const razorpay = new window.Razorpay(options);
+        razorpay.on("payment.failed", function (resp) {
+          console.error("[GrowthLoop] Payment failed:", resp.error);
+          showToast(
+            `Payment failed: ${resp.error?.description || "Payment was rejected."}`,
+            "error"
+          );
+        });
+
+        console.log("[GrowthLoop] Calling razorpay.open()");
+        razorpay.open();
+
+        showToast(
+          `Strategy promoted! Opening Razorpay Test Checkout for order ${order.id}...`
+        );
+      } else {
+        showToast(
+          typeof result.error === "string"
+            ? result.error
+            : Array.isArray(result.error)
+            ? result.error.join(" ")
+            : "Promotion blocked by guardrails.",
+          "warning"
+        );
+      }
+    } catch (error) {
+      console.error("[GrowthLoop] Deployment request failed:", error);
+      showToast("Deployment request failed.", "error");
+    } finally {
+      setIsDeploying(false);
+    }
   };
 
+  // ----------------------------------------------------------
+  // API: Reset Experiment
+  // ----------------------------------------------------------
   const resetAll = async () => {
-    await fetch("http://localhost:8000/api/reset", { method: "POST" });
-    await fetchState();
+    setIsResetting(true);
+    try {
+      const response = await fetch(`${API}/api/reset`, {
+        method: "POST",
+      });
+
+      if (!response.ok) {
+        throw new Error("Reset failed");
+      }
+
+      await fetchState();
+      setActiveView("experiment");
+      showToast("Experiment reset to initial Beta(1,1) priors. Audit chain preserved.");
+    } catch (error) {
+      console.error(error);
+      showToast("Unable to reset experiment.", "error");
+    } finally {
+      setIsResetting(false);
+    }
   };
+
+  // ----------------------------------------------------------
+  // Derived Calculations
+  // ----------------------------------------------------------
+  const activeArms = useMemo(() => {
+    return data.arms?.filter((arm) => arm.status !== "PAUSED") || [];
+  }, [data.arms]);
+
+  const winner = useMemo(() => {
+    if (!data.arms?.length) return null;
+    // Prefer leader designated by backend experiment summary
+    if (data.experiment?.leader_arm_id) {
+      const armMatch = data.arms.find(
+        (a) => a.arm_id === data.experiment.leader_arm_id
+      );
+      if (armMatch) return armMatch;
+    }
+    // Fallback: arm with highest win_rate
+    return [...data.arms].sort(
+      (a, b) => (b.win_rate || 0) - (a.win_rate || 0)
+    )[0];
+  }, [data.arms, data.experiment]);
+
+  const totalTrials = useMemo(() => {
+    return data.arms?.reduce((sum, arm) => sum + (arm.trials || 0), 0) || 0;
+  }, [data.arms]);
+
+  const totalConversions = useMemo(() => {
+    return data.arms?.reduce((sum, arm) => sum + (arm.conversions || 0), 0) || 0;
+  }, [data.arms]);
+
+  const overallConversion =
+    totalTrials > 0
+      ? ((totalConversions / totalTrials) * 100).toFixed(2)
+      : "0.00";
+
+  const promoted = useMemo(() => {
+    return data.arms?.some((arm) => arm.status === "PROMOTED") || false;
+  }, [data.arms]);
+
+  const chartData = useMemo(() => {
+    return (
+      data.arms?.map((arm) => ({
+        name: arm.label,
+        probability: arm.win_rate || 0,
+        status: arm.status,
+      })) || []
+    );
+  }, [data.arms]);
 
   return (
-    <div className="min-h-screen bg-black text-zinc-100 font-mono p-6">
-      {/* Top Telemetry Header */}
-      <header className="border-b border-zinc-800 pb-4 mb-6 flex flex-wrap justify-between items-center gap-4">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            <h1 className="text-sm font-semibold tracking-wider uppercase text-zinc-200">
-              GROWTHLOOP // AGENTIC CHECKOUT ENGINE
-            </h1>
-          </div>
-          <p className="text-xs text-zinc-500 mt-1">
-            Gemini Hypothesis Generation + Thompson Sampling + Razorpay Gateway
-          </p>
-        </div>
+    <div className="app-shell">
+      {/* SIDEBAR */}
+      <Sidebar
+        activeView={activeView}
+        setActiveView={setActiveView}
+        isConnected={isConnected}
+        mobileOpen={mobileOpen}
+        setMobileOpen={setMobileOpen}
+      />
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={resetAll}
-            className="p-2 border border-zinc-800 hover:bg-zinc-900 rounded text-zinc-400"
-            title="Reset Experiment"
-          >
-            <RotateCcw className="w-4 h-4" />
-          </button>
-          <button
-            onClick={triggerViolation}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-red-950/40 border border-red-900/60 hover:bg-red-900/60 text-red-300 rounded text-xs transition"
-          >
-            <AlertTriangle className="w-3.5 h-3.5" />
-            Inject Poison Strategy
-          </button>
-          <button
-            onClick={runBatch}
-            disabled={isProcessing}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-xs text-zinc-200 transition"
-          >
-            <Play className="w-3.5 h-3.5" />
-            Route +25 Checkouts
-          </button>
-          <button
-            onClick={deployTopArm}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-black font-semibold rounded text-xs transition"
-          >
-            <CheckCircle2 className="w-3.5 h-3.5 text-black" />
-            Promote to Razorpay
-          </button>
-        </div>
-      </header>
-
-      {/* LLM Merchant Context Prompt Bar */}
-      <section className="bg-zinc-950 border border-zinc-800 rounded-md p-3.5 mb-6">
-        <div className="text-[11px] text-zinc-400 font-medium mb-2 flex items-center gap-1.5">
-          <Sparkles className="w-3.5 h-3.5 text-purple-400" />
-          <span>MERCHANT CONTEXT // AUTONOMOUS HYPOTHESIS GENERATOR</span>
-        </div>
-        <div className="flex flex-col sm:flex-row gap-3">
-          <input
-            type="text"
-            value={merchantContext}
-            onChange={(e) => setMerchantContext(e.target.value)}
-            placeholder="Enter store scenario, target margins, or drop-off trends..."
-            className="flex-1 bg-zinc-900 border border-zinc-800 rounded px-3 py-2 text-xs text-zinc-200 focus:outline-none focus:border-purple-500 transition"
+      {/* MAIN APPLICATION CONTENT */}
+      <main className="main-content">
+        <div className="content-container">
+          {/* TOP PAGE HEADER */}
+          <PageHeader
+            activeView={activeView}
+            onRefresh={fetchState}
+            onReset={resetAll}
+            isResetting={isResetting}
+            isConnected={isConnected}
+            onToggleMobileMenu={() => setMobileOpen(true)}
           />
-          <button
-            onClick={handleGenerateHypotheses}
-            disabled={isGenerating}
-            className="flex items-center justify-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white rounded text-xs font-semibold whitespace-nowrap transition"
-          >
-            {isGenerating ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Analyzing via Gemini...
-              </>
-            ) : (
-              <>
-                <Sparkles className="w-3.5 h-3.5" />
-                Generate AI Hypotheses
-              </>
-            )}
-          </button>
+
+          {/* DYNAMIC VIEW ROUTER */}
+          {activeView === "experiment" && (
+            <ExperimentView
+              data={data}
+              winner={winner}
+              activeArms={activeArms}
+              totalTrials={totalTrials}
+              totalConversions={totalConversions}
+              overallConversion={overallConversion}
+              promoted={promoted}
+              chartData={chartData}
+              merchantContext={merchantContext}
+              setMerchantContext={setMerchantContext}
+              onGenerateHypotheses={handleGenerateHypotheses}
+              isGenerating={isGenerating}
+              onRouteBatch={runBatch}
+              isProcessing={isProcessing}
+              onDeployWinner={deployTopArm}
+              isDeploying={isDeploying}
+              onTriggerViolation={triggerViolation}
+              isTestingGuardrail={isTestingGuardrail}
+              onNavigateView={setActiveView}
+            />
+          )}
+
+          {activeView === "performance" && (
+            <PerformanceView
+              data={data}
+              winner={winner}
+              activeArms={activeArms}
+              totalTrials={totalTrials}
+              totalConversions={totalConversions}
+              overallConversion={overallConversion}
+              chartData={chartData}
+            />
+          )}
+
+          {activeView === "guardrails" && (
+            <GuardrailsView
+              data={data}
+              winner={winner}
+              onTriggerViolation={triggerViolation}
+              isTestingGuardrail={isTestingGuardrail}
+              lastViolationResult={lastViolationResult}
+            />
+          )}
+
+          {activeView === "audit" && <AuditView data={data} />}
+
+          {/* SAAS FOOTER */}
+          <footer className="app-footer">
+            <div className="footer-left">
+              <span>GrowthLoop Autonomous Revenue Engine</span>
+              <span className="footer-sep">·</span>
+              <span>Thompson Sampling · Gemini · Razorpay Test Mode</span>
+            </div>
+            <div className="footer-right">
+              <span>Deterministic Guardrails Active</span>
+            </div>
+          </footer>
         </div>
-      </section>
-
-      {/* Main Telemetry & Visuals */}
-      <main className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Left 2 Cols: Distribution Graph & Candidate Table */}
-        <section className="lg:col-span-2 space-y-6">
-          <div className="bg-zinc-950 border border-zinc-800 p-5 rounded-md">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
-                Posterior Conversion Probabilities (Thompson Sampling)
-              </h2>
-              <span className="text-[11px] text-zinc-500">Live Beta Sampling</span>
-            </div>
-            <div className="h-56 w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={data.arms}>
-                  <XAxis dataKey="label" stroke="#52525b" fontSize={11} tickLine={false} />
-                  <YAxis stroke="#52525b" fontSize={11} unit="%" tickLine={false} />
-                  <Tooltip 
-                    contentStyle={{ backgroundColor: "#09090b", borderColor: "#27272a", fontSize: "11px" }}
-                  />
-                  <Bar dataKey="win_rate" radius={[2, 2, 0, 0]}>
-                    {data.arms.map((entry, index) => (
-                      <Cell 
-                        key={`cell-${index}`} 
-                        fill={entry.status === "PROMOTED" ? "#10b981" : "#3f3f46"} 
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-
-          <div className="bg-zinc-950 border border-zinc-800 rounded-md overflow-hidden">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-zinc-900/50 text-zinc-400 border-b border-zinc-800">
-                <tr>
-                  <th className="p-3 font-normal">Candidate Arm</th>
-                  <th className="p-3 font-normal">Discount</th>
-                  <th className="p-3 font-normal">Trials</th>
-                  <th className="p-3 font-normal">Conversions</th>
-                  <th className="p-3 font-normal">Win Rate</th>
-                  <th className="p-3 font-normal">Priors (α/β)</th>
-                  <th className="p-3 font-normal">Status</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-zinc-800/60">
-                {data.arms.map((arm) => (
-                  <tr key={arm.arm_id} className="hover:bg-zinc-900/30 transition">
-                    <td className="p-3 font-medium text-zinc-200">{arm.label}</td>
-                    <td className="p-3 text-zinc-400">{arm.discount_pct}%</td>
-                    <td className="p-3 text-zinc-400">{arm.trials}</td>
-                    <td className="p-3 text-zinc-400">{arm.conversions}</td>
-                    <td className="p-3 font-semibold text-emerald-400">{arm.win_rate}%</td>
-                    <td className="p-3 text-zinc-500">{arm.alpha} / {arm.beta}</td>
-                    <td className="p-3">
-                      <span className={`px-2 py-0.5 rounded text-[10px] ${
-                        arm.status === "PROMOTED"
-                          ? "bg-emerald-950 text-emerald-300 border border-emerald-800"
-                          : "bg-zinc-800 text-zinc-400"
-                      }`}>
-                        {arm.status}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        {/* Right Col: Audit Stream */}
-        <section className="bg-zinc-950 border border-zinc-800 rounded-md p-4 flex flex-col h-[580px]">
-          <div className="flex items-center justify-between border-b border-zinc-800 pb-3 mb-3">
-            <div className="flex items-center gap-1.5 text-zinc-400">
-              <ShieldCheck className="w-4 h-4 text-emerald-500" />
-              <h2 className="text-xs font-semibold uppercase tracking-wider">Immutable Audit Trail</h2>
-            </div>
-            <span className="text-[10px] text-zinc-600">Deterministic Guardrails</span>
-          </div>
-
-          <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
-            {data.audit_trail.slice().reverse().map((log, index) => (
-              <div 
-                key={index} 
-                className={`p-2.5 rounded border text-xs leading-relaxed ${
-                  log.status === "CRITICAL"
-                    ? "bg-red-950/20 border-red-900/50 text-red-300"
-                    : log.status === "SUCCESS"
-                    ? "bg-emerald-950/20 border-emerald-900/50 text-emerald-300"
-                    : "bg-zinc-900/40 border-zinc-800/80 text-zinc-300"
-                }`}
-              >
-                <div className="flex justify-between items-center text-[10px] mb-1 font-mono text-zinc-500">
-                  <span>{log.timestamp}</span>
-                  <span className="uppercase font-semibold tracking-wider">{log.type}</span>
-                </div>
-                <p>{log.message}</p>
-              </div>
-            ))}
-          </div>
-        </section>
       </main>
+
+      {/* TOAST NOTIFICATION */}
+      <Toast toast={toast} onClose={() => setToast(null)} />
     </div>
   );
 }
+
+export default App;

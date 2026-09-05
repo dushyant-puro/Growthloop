@@ -1,109 +1,149 @@
 import os
-import time
 import uuid
 import logging
+import os
 from typing import Dict, Any, Optional
+from dotenv import load_dotenv
 
-logger = logging.getLogger("growthloop.razorpay")
+load_dotenv()
+
+
+
+import razorpay
+
+
+logger = logging.getLogger(
+    "growthloop.razorpay"
+)
+
+
+class RazorpayConfigurationError(Exception):
+    pass
+
+
+class RazorpayOrderError(Exception):
+    pass
 
 
 class RazorpayClientWrapper:
     """
-    Razorpay test-mode client with basic auth and graceful mock fallbacks.
-    Handles order creation in INR (subunits: paise) and falls back to simulated
-    orders if test credentials fail or network/auth errors occur.
+    Razorpay Test Mode order client.
+
+    IMPORTANT:
+    This client does not fabricate successful orders.
+
+    If credentials are missing or the Razorpay API fails,
+    an exception is raised and the caller can display a
+    graceful failure state.
     """
 
     def __init__(
         self,
         key_id: Optional[str] = None,
-        key_secret: Optional[str] = None,
+        key_secret: Optional[str] = None
     ):
-        self.key_id = key_id or os.getenv("RAZORPAY_KEY_ID", "rzp_test_mockGrowthLoopKey")
-        self.key_secret = key_secret or os.getenv("RAZORPAY_KEY_SECRET", "mockGrowthLoopSecret")
-        self._razorpay_client = None
 
-        try:
-            import razorpay
-            # Razorpay SDK uses HTTP Basic Auth (key_id, key_secret)
-            self._razorpay_client = razorpay.Client(auth=(self.key_id, self.key_secret))
-            logger.info("Initialized Razorpay client with Key ID: %s...", self.key_id[:10])
-        except Exception as err:
-            logger.warning("Failed to initialize official Razorpay client: %s. Using mock fallback mode.", err)
-            self._razorpay_client = None
+        self.key_id = key_id or os.getenv(
+            "RAZORPAY_KEY_ID"
+        )
+
+        self.key_secret = key_secret or os.getenv(
+            "RAZORPAY_KEY_SECRET"
+        )
+
+        if not self.key_id:
+            raise RazorpayConfigurationError(
+                "RAZORPAY_KEY_ID is not configured."
+            )
+
+        if not self.key_secret:
+            raise RazorpayConfigurationError(
+                "RAZORPAY_KEY_SECRET is not configured."
+            )
+
+        self.client = razorpay.Client(
+            auth=(
+                self.key_id,
+                self.key_secret
+            )
+        )
 
     def create_order(
         self,
         amount_inr: float,
-        currency: str = "INR",
         receipt: Optional[str] = None,
-        notes: Optional[Dict[str, Any]] = None,
+        notes: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """
-        Creates a payment order. Converts amount in INR to paise (subunits).
-        If live/test API call fails or mock keys are used, returns a graceful mock order.
-        """
-        amount_paise = int(round(amount_inr * 100))
-        receipt_id = receipt or f"rcpt_{uuid.uuid4().hex[:10]}"
-        order_notes = notes or {}
+
+        if amount_inr <= 0:
+            raise RazorpayOrderError(
+                "Order amount must be greater than zero."
+            )
+
+        amount_paise = int(
+            round(amount_inr * 100)
+        )
+
+        receipt_id = (
+            receipt
+            or f"growthloop_{uuid.uuid4().hex[:12]}"
+        )
 
         payload = {
             "amount": amount_paise,
-            "currency": currency,
+            "currency": "INR",
             "receipt": receipt_id,
-            "notes": order_notes,
-            "payment_capture": 1,
+            "notes": notes or {}
         }
 
-        # Attempt API call if SDK client is initialized and keys are not generic dummy keys
-        if self._razorpay_client and not self.key_id.startswith("rzp_test_mock"):
-            try:
-                order_response = self._razorpay_client.order.create(data=payload)
-                order_response["is_mock"] = False
-                logger.info("Razorpay order created successfully: %s", order_response.get("id"))
-                return order_response
-            except Exception as exc:
-                logger.warning(
-                    "Razorpay API call failed (%s). Falling back gracefully to mock order.",
-                    exc,
-                )
+        try:
 
-        # Graceful Mock Fallback
-        mock_order_id = f"order_mock_{uuid.uuid4().hex[:14]}"
-        mock_order = {
-            "id": mock_order_id,
-            "entity": "order",
-            "amount": amount_paise,
-            "amount_paid": 0,
-            "amount_due": amount_paise,
-            "currency": currency,
-            "receipt": receipt_id,
-            "status": "created",
-            "attempts": 0,
-            "notes": order_notes,
-            "created_at": int(time.time()),
-            "is_mock": True,
-            "mock_reason": "Test mode / Fallback active",
-        }
-        logger.info("Generated mock Razorpay order: %s for ₹%.2f", mock_order_id, amount_inr)
-        return mock_order
+            order = self.client.order.create(
+                data=payload
+            )
+
+            order["is_test_mode"] = True
+
+            return order
+
+        except Exception as exc:
+
+            logger.exception(
+                "Razorpay order creation failed"
+            )
+
+            raise RazorpayOrderError(
+                f"Razorpay API failed: {str(exc)}"
+            ) from exc
 
 
-_default_client = RazorpayClientWrapper()
+_default_client = None
+
+
+def get_razorpay_client():
+
+    global _default_client
+
+    if _default_client is None:
+        _default_client = RazorpayClientWrapper()
+
+    return _default_client
 
 
 def create_razorpay_order(
     amount_inr: float,
     arm_id: Optional[str] = None,
     receipt: Optional[str] = None,
-    notes: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Top-level convenience function used by main.py to generate a Razorpay order."""
-    order_notes = dict(notes) if notes else {}
+    notes: Optional[Dict[str, Any]] = None
+):
+
+    order_notes = dict(notes or {})
+
     if arm_id:
         order_notes["arm_id"] = arm_id
-    return _default_client.create_order(
+
+    return get_razorpay_client().create_order(
         amount_inr=amount_inr,
         receipt=receipt,
-        notes=order_notes,
+        notes=order_notes
     )
